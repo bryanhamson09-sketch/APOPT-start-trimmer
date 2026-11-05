@@ -36,6 +36,21 @@ def main():
     quiet[240] += 2
     event = server.motion_events(times,quiet,times[-1],.75)
     assert event['onsetDetection'] is None
+    assert event['start'] is None  # Never substitute the largest noise/motion peak.
+    for shape in ('linear','oscillating','two_lobes'):
+        times=[i/120 for i in range(720)]
+        randomizer=random.Random(43)
+        scores=[]
+        for t in times:
+            r=max(0,t-2.5)
+            if shape=='linear': movement=min(3,3.75*r)
+            elif shape=='oscillating': movement=min(3,5*r)+(.035*math.sin(80*r) if r>0 else 0)
+            else: movement=min(.7,3.5*r)+min(2.3,max(0,t-3.05)*8)
+            scores.append(.2+movement+randomizer.gauss(0,.008) if t<4.5 else .2)
+        event=server.motion_events(times,scores,6,.75)
+        assert event['start'] is not None and abs(event['start']-2.5)<=.085,(shape,event['start'])
+        assert event['start']<3.0  # A later large lobe or peak must not become onset.
+        results.append(dict(fps=120,shape=shape,onset=event['start']))
     # Real clip comparison is a lag regression, not manually labeled ground truth.
     saved = server.ROOT.parent/'outputs/start-video-editor/IMG_1708-tight-report.json'
     if saved.exists():

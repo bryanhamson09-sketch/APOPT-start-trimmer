@@ -19,6 +19,9 @@ async function main(){
   const retry=new VideoQueue();retry.add([file('retry.mov')]);let calls=0;
   const retryOps={analyze:async()=>{calls++;return {id:'retry',inTime:1,outTime:3,confidence:'Candidate found',onsetDetection:{}}},export:async()=>{throw Error('Export failed')}};
   await retry.run({},retryOps);retry.retry();await retry.run({}, {...retryOps,export:async()=>({duration:2})});assert.equal(calls,1);assert.equal(retry.items[0].status,'Done');
+  const limited=new VideoQueue();limited.add([file('long.mov')]);
+  await limited.run({}, {...retryOps,export:async()=>{throw Error('Review required: cannot meet duration limit')}});
+  assert.equal(limited.items[0].status,'Review');assert.equal(limited.items[0].exported,null);
   console.log('Queue checks passed: serial processing, folders, duplicate names, failures, review hold, stop/resume, export retry.');
 }
 main().catch(e=>{console.error(e);process.exitCode=1});

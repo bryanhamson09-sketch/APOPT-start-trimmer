@@ -1,5 +1,6 @@
 """Loopback-only start-video editor. Python standard library + local FFmpeg."""
 import json
+import bisect
 import math
 from pathlib import Path
 import secrets
@@ -9,6 +10,8 @@ import subprocess
 import tempfile
 import threading
 import zipfile
+import hashlib
+from timeline import limit_playback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -19,6 +22,8 @@ JOBS = {}
 BUNDLES = {}
 LOCK = threading.Lock()
 MAX_BYTES = 512 * 1024 * 1024
+MAX_PLAYBACK_SECONDS = 3.5
+MAX_EXTRA_CONTEXT_SECONDS = .25
 
 
 def binary(name):
@@ -78,70 +83,96 @@ def fit_motion(times, scores):
 
 
 def curvature_onset(times, fit):
-    values, second = fit['smoothed'], fit['curvature']
+    """Find a motion episode from curvature energy, then fit its onset change point."""
+    values, second, clean = fit['smoothed'], fit['curvature'], fit['despiked']
     dt = statistics.median([b-a for a,b in zip(times,times[1:]) if b>a])
-    def samples(a,b):
-        return range(max(0,a), min(len(times),b))
-    candidates = []
-    for i in range(max(4,round(.4/dt)),len(times)-max(3,round(.25/dt))):
-        past = list(samples(i-round(.4/dt), i-round(.12/dt)))
-        baseline = statistics.median([values[j] for j in past])
-        noise = max(.015,1.4826*statistics.median([abs(values[j]-baseline) for j in past]))
-        acc_base = statistics.median([second[j] for j in past])
-        acc_noise = max(1.,1.4826*statistics.median([abs(second[j]-acc_base) for j in past]))
-        threshold = max(3., acc_base+4*acc_noise)
-        sustain = list(samples(i,i+max(2,round(.025/dt))))
-        future = list(samples(i+round(.12/dt),i+round(.25/dt)))
-        gain = statistics.mean([values[j] for j in future])-baseline
-        # The rise confirms an acceleration event after the fact; its timestamp
-        # comes from the curvature crossing, not from the later amplitude rise.
-        if (second[i] > threshold and
-            sum(second[j]>threshold for j in sustain) >= math.ceil(len(sustain)*.65) and
-            fit['slope'][i] > 0 and gain > max(.15,6*noise) and
-            gain > max(0,baseline)*.4):
-            candidates.append((gain/(max(0,baseline)+noise+.1),i,threshold))
+    def span(a,b):
+        return range(max(0,a),min(len(times),b))
+    candidates=[]
+    for i in range(max(4,round(.4/dt)),len(times)-max(3,round(.3/dt))):
+        past=list(span(i-round(.4/dt),i-round(.12/dt)))
+        baseline=statistics.median([values[j] for j in past])
+        noise=max(.015,1.4826*statistics.median([abs(values[j]-baseline) for j in past]))
+        center=statistics.median([second[j] for j in past])
+        curvature_noise=max(1.,1.4826*statistics.median([abs(second[j]-center) for j in past]))
+        threshold=max(4.,3*curvature_noise)
+        energy_window=list(span(i,i+max(2,round(.05/dt))))
+        energy=math.sqrt(statistics.mean([(second[j]-center)**2 for j in energy_window]))
+        future=list(span(i+round(.12/dt),i+round(.4/dt)))
+        gain=statistics.mean([values[j] for j in future])-baseline
+        if energy>threshold and gain>max(.06,4*noise) and gain>max(0,baseline)*.25:
+            candidates.append(dict(index=i,score=gain/(max(0,baseline)+noise+.1),
+                                   threshold=threshold,baseline=baseline,noise=noise))
     if not candidates:
-        return None, None
-    _, peak_idx, threshold = max(candidates)
-    # Several acceleration lobes can belong to one launch. Keep its earliest
-    # significant lobe rather than letting a later, larger lobe add detection lag.
-    _, peak_idx, threshold = min((c for c in candidates
-                                  if 0 <= times[peak_idx]-times[c[1]] <= .25),
-                                 key=lambda c:c[1])
-    # Follow the significant curvature lobe back to its first frame.
-    idx = peak_idx
-    while idx>0 and times[peak_idx]-times[idx-1] <= .2 and second[idx-1] > threshold:
-        idx -= 1
-    curvature_idx = idx
-    # A centered smoother can spread a sharp edge backwards by half its window.
-    # Refine the curvature event with a fitted flat-to-rise change point on the
-    # despiked samples, rather than stamping that smoothing pre-response as onset.
-    local = [j for j,t in enumerate(times) if times[idx]-.18 <= t <= times[idx]+.28]
-    quiet = [fit['despiked'][j] for j in local if times[j] < times[idx]-.08]
-    baseline = statistics.median(quiet or [fit['despiked'][idx]])
-    best = (float('inf'),idx)
-    for candidate in (j for j in local if times[idx]-.025 <= times[j] <= times[idx]+.12):
-        for rise in (0., .05, .10, .20, .35):
-            for power in ((1,) if rise == 0 else (1,2,3)):
-                basis = [(float(times[j]>=times[candidate]) if rise == 0 else
-                          min(1.,max(0.,(times[j]-times[candidate])/rise))**power) for j in local]
-                norm = sum(b*b for b in basis)
-                amplitude = max(0.,sum(b*(fit['despiked'][j]-baseline) for j,b in zip(local,basis))/max(norm,1e-12))
-                error = sum((fit['despiked'][j]-baseline-amplitude*b)**2 for j,b in zip(local,basis))
-                if error < best[0]:
-                    best = error,candidate
-    idx = best[1]
-    return idx, dict(curvatureThreshold=threshold, thresholdFrame=peak_idx,
-                     curvatureCrossingTime=times[curvature_idx],
-                     refinement='Fitted flat-to-rise change point corrects centered-smoothing pre-response',
-                     onsetFrame=idx, onsetTime=times[idx],
-                     method='Sustained positive second derivative above quiet-baseline noise; subsequent rise confirms event')
+        return None,None
+    # Opposite-sign lobes belong to one episode until there is a substantial gap.
+    # Rank episodes by confirmed activity, then use their FIRST departure.
+    groups=[]
+    for candidate in candidates:
+        separated = not groups
+        if groups and times[candidate['index']]-times[groups[-1][-1]['index']]>.35:
+            previous=groups[-1]
+            quiet_limit=previous[0]['baseline']+max(.04,3*previous[0]['noise'])
+            run=0
+            for j in range(previous[-1]['index'],candidate['index']):
+                run=run+1 if values[j]<=quiet_limit else 0
+                if run>=max(2,round(.12/dt)):
+                    separated=True
+                    break
+        if separated:
+            groups.append([])
+        groups[-1].append(candidate)
+    group=max(groups,key=lambda g:max(c['score'] for c in g))
+    first=group[0];crossing=first['index']
+    # Estimate a drifting quiet baseline from despiked, unsmoothed samples.
+    quiet=[j for j,t in enumerate(times) if times[crossing]-.4<=t<times[crossing]-.1]
+    baseline=statistics.median([clean[j] for j in quiet])
+    noise=max(.015,1.4826*statistics.median([abs(clean[j]-baseline) for j in quiet]))
+    mean_t=statistics.mean([times[j] for j in quiet])
+    mean_y=statistics.mean([clean[j] for j in quiet])
+    denominator=sum((times[j]-mean_t)**2 for j in quiet)
+    drift=sum((times[j]-mean_t)*(clean[j]-mean_y) for j in quiet)/max(denominator,1e-12)
+    def base(t):return baseline+drift*(t-mean_t)
+    local=[j for j,t in enumerate(times) if times[crossing]-.35<=t<=times[crossing]+.42]
+    best=(float('inf'),None,None)
+    for candidate in (j for j in local if times[crossing]-.20<=times[j]<=times[crossing]+.24):
+        pre=[j for j in local if times[candidate]-.12<=times[j]<times[candidate]]
+        # A candidate at the motion peak cannot pass if the signal was already
+        # persistently above its quiet baseline immediately before that candidate.
+        if len(pre)<2 or statistics.median([clean[j]-base(times[j]) for j in pre])>max(.04,3*noise):
+            continue
+        for rise in (0.,.05,.1,.2,.35,.5,.8):
+            for power in ((1,) if rise==0 else (1,2,3)):
+                basis=[float(times[j]>=times[candidate]) if rise==0 else
+                       min(1.,max(0.,(times[j]-times[candidate])/rise))**power for j in local]
+                residual=[clean[j]-base(times[j]) for j in local]
+                amplitude=max(0.,sum(x*y for x,y in zip(basis,residual))/max(sum(x*x for x in basis),1e-12))
+                def huber(error):
+                    z=abs(error)/noise
+                    return z*z/2 if z<=2 else 2*(z-1)
+                cost=sum(huber(y-amplitude*x) for x,y in zip(basis,residual))
+                if cost<best[0]:best=cost,candidate,dict(riseSeconds=rise,power=power,amplitude=amplitude,
+                                                     baseline=baseline,baselineReferenceTime=mean_t,baselineDrift=drift)
+    idx=best[1]
+    if idx is None:
+        return None,None
+    fit['changePointFit'] = dict(times=[times[j] for j in local],
+        values=[base(times[j])+best[2]['amplitude']*(float(times[j]>=times[idx]) if best[2]['riseSeconds']==0 else
+                min(1.,max(0.,(times[j]-times[idx])/best[2]['riseSeconds']))**best[2]['power']) for j in local],
+        baseline=[base(times[j]) for j in local])
+    return idx,dict(method='Curvature-energy episode + robust baseline-to-rise change-point fit',
+                    curvatureThreshold=first['threshold'],curvatureCrossingTime=times[crossing],
+                    onsetFrame=idx,onsetTime=times[idx],baselineNoise=noise,baselineDrift=drift,
+                    changePointModel=best[2],episodeCandidates=len(group),
+                    episodes=[dict(start=times[g[0]['index']],end=times[g[-1]['index']],
+                                   strength=max(c['score'] for c in g)) for g in groups],
+                    refinement='Earliest departure in the selected episode; late candidates with already-moving prehistory rejected')
 
 
 def motion_events(times, scores, duration, lead):
     """Heuristic: sustained movement after a quiet window; sustained quiet after launch."""
     if len(scores) < 6 or max(scores, default=0) < 0.15:
-        return dict(set=0, start=min(.5, duration), exit=duration, inTime=0,
+        return dict(set=0, start=None, exit=duration, inTime=0,
                     outTime=duration, confidence='Review required', reason='Too little motion to identify a reliable start.')
     dt = statistics.median([b-a for a, b in zip(times, times[1:]) if b > a])
     window = max(2, round(.22 / dt))
@@ -151,12 +182,11 @@ def motion_events(times, scores, duration, lead):
     peak = max(smooth)
     idx, onset_details = curvature_onset(times, fit)
     if idx is None:
-        idx = max(range(len(smooth)), key=lambda i: smooth[i])
-        reason = 'No significant sustained curvature rise found; largest motion peak shown for manual review.'
-        confidence = 'Review required'
-    else:
-        reason = 'Onset detected from the fitted motion signal’s second derivative; confirm the pre-onset pose is included.'
-        confidence = 'Candidate found'
+        return dict(set=0,start=None,exit=duration,inTime=0,outTime=duration,
+                    confidence='Review required',reason='No reliable baseline-to-rise change point found. Mark onset manually; no motion peak was substituted.',
+                    motionFit=fit,onsetDetection=None)
+    reason='Onset estimated at the quiet-to-motion change point; curvature oscillation energy identifies the rise episode.'
+    confidence='Candidate found'
     quiet_end = max(1, idx-round(.15/dt))
     set_idx = max(0, quiet_end-window)
     quiet_samples = smooth[set_idx:quiet_end] or [floor]
@@ -185,6 +215,8 @@ def motion_events(times, scores, duration, lead):
 def tighten_selection(events, keys, target=3.5):
     """Trade preferred lead-in for another keyframe, retaining 0.5s before onset."""
     events = dict(events)
+    if events.get('start') is None:
+        return events
     original_in = events['inTime']
     head = max((t for t in keys if t <= original_in+1e-6), default=0)
     if events['outTime']-head > target:
@@ -229,7 +261,238 @@ def analyze(source, folder, lead, tight=True):
         events = tighten_selection(events, keys)
     return dict(duration=duration, fps=video.get('avg_frame_rate'), width=video['width'],
                 height=video['height'], codec=video['codec_name'], frames=count,
-                times=times, scores=scores, keys=keys, **events)
+                times=times, scores=scores, keys=keys, durationLimit=MAX_PLAYBACK_SECONDS if tight else None, **events)
+
+
+class UnsafeCutError(ValueError):
+    def __init__(self, message, boundary='tail'):
+        super().__init__(message)
+        self.boundary = boundary
+
+
+def _export_attempt(job, start, end, actual_start, actual_end, ident, cache, playback_end=None):
+    data = job['result']
+    ext = job['source'].suffix.lower()
+    ext = ext if ext in ('.mp4','.mov') else '.mkv'
+    output = job['folder']/('clip'+ext)
+    # Only the head requires a keyframe. Packet decode order retains references
+    # required by the tail; decoded-frame checks below validate the result.
+    args = ['-y', '-ss', str(actual_start), '-i', str(job['source']), '-t',
+            str(actual_end-actual_start), '-map', '0:v:0', '-map', '0:a?', '-map_metadata', '0',
+            '-map_chapters', '-1', '-c', 'copy', '-avoid_negative_ts', 'disabled']
+    if ext in ('.mp4', '.mov'):
+        args += ['-movflags', '+faststart', '-use_editlist', '1']
+    args += [str(output)]
+    run('ffmpeg', args)
+    timeline = None
+    if playback_end is not None and ext in ('.mp4','.mov'):
+        try:
+            timeline = limit_playback(output, playback_end-actual_start)
+        except ValueError as error:
+            output.unlink(missing_ok=True)
+            raise ValueError('Review required: unsupported playback edits. '+str(error)) from error
+    # Verify preservation of encoded video packets against source packet sequence.
+    def packets(path):
+        return probe(path, ['-select_streams','v:0','-show_packets','-show_data_hash','sha256',
+                            '-show_entries','packet=data_hash,pts_time,duration_time'])['packets']
+    if 'packets' not in cache:
+        cache['packets'] = packets(job['source'])
+    original_packets, clipped_packets = cache['packets'], packets(output)
+    original = [p['data_hash'] for p in original_packets]
+    clipped = [p['data_hash'] for p in clipped_packets]
+    offset = next((i for i in range(len(original)-len(clipped)+1)
+                   if original[i:i+len(clipped)] == clipped), None) if clipped else None
+    matching = offset is not None
+    timing_verified = False
+    coverage = None
+    if matching:
+        corresponding = original_packets[offset:offset+len(clipped)]
+        source_pts = [float(p['pts_time']) for p in corresponding]
+        output_pts = [float(p['pts_time']) for p in clipped_packets]
+        timing_verified = all(abs((a-source_pts[0])-(b-output_pts[0])) < .0001
+                              for a,b in zip(source_pts,output_pts))
+        source_origin = float(original_packets[0]['pts_time'])
+        coverage = [min(source_pts)-source_origin,
+                    max(float(p['pts_time'])+float(p.get('duration_time',0))
+                        for p in corresponding)-source_origin]
+        matching = coverage[0] <= start+.001 and coverage[1] >= end-.001
+    if not matching or not timing_verified:
+        output.unlink(missing_ok=True)
+        raise UnsafeCutError('Export verification failed: content, timing, or requested coverage differs from the source.')
+    def decoded_hashes(path):
+        raw = run('ffmpeg', ['-err_detect', 'explode', '-i', str(path), '-map', '0:v:0',
+                             '-an', '-fps_mode', 'passthrough', '-f', 'framemd5', '-'])
+        return [line.split(',')[-1].strip() for line in raw.decode().splitlines()
+                if line and not line.startswith('#')]
+    if 'decoded' not in cache:
+        cache['decoded'] = decoded_hashes(job['source'])
+    source_decoded = cache['decoded']
+    try:
+        output_decoded = decoded_hashes(output)
+    except ValueError as error:
+        output.unlink(missing_ok=True)
+        raise UnsafeCutError(str(error)) from error
+    decoded_offset = next((i for i in range(len(source_decoded)-len(output_decoded)+1)
+                           if source_decoded[i:i+len(output_decoded)] == output_decoded), None) if output_decoded else None
+    output_info = probe(output, ['-show_streams', '-show_format'])
+    output_video = next(s for s in output_info['streams'] if s['codec_type'] == 'video')
+    measured_duration = float(output_video.get('duration') or output_info['format']['duration'])
+    video_start = float(output_video.get('start_time', 0))
+    if abs(video_start) > .05 or float(output_info['format']['duration']) > measured_duration+.1:
+        output.unlink(missing_ok=True)
+        raise UnsafeCutError('Export has an inconsistent playback timeline.')
+    if decoded_offset is None or len(output_decoded) < 2:
+        output.unlink(missing_ok=True)
+        kind = 'head' if not output_decoded or output_decoded[0] not in set(source_decoded) else 'tail'
+        raise UnsafeCutError('Export did not decode to a continuous sequence of original frames.', kind)
+    source_times = data['times']
+    if len(source_decoded) != len(source_times):
+        output.unlink(missing_ok=True)
+        raise ValueError('Source decode timestamps and frame count differ; manual review is required.')
+    last = decoded_offset+len(output_decoded)
+    decoded_coverage = [source_times[decoded_offset],
+                        source_times[last] if last < len(source_times) else data['duration']]
+    if decoded_coverage[0] > start+.001 or decoded_coverage[1] < end-.001:
+        output.unlink(missing_ok=True)
+        raise UnsafeCutError('Decoded frames do not cover the requested interval.',
+                             'head' if decoded_coverage[0] > start+.001 else 'tail')
+    actual_end = coverage[1]
+    if 'metadata' not in cache:
+        cache['metadata'] = probe(job['source'], ['-show_streams', '-show_format'])
+    report = dict(requestedStart=start, requestedEnd=end, exportStart=actual_start,
+                  exportEnd=actual_end, original=data, videoPacketsVerified=True,
+                  relativePresentationTimingVerified=timing_verified,
+                  sourcePresentationCoverage=coverage,
+                  decodedSourceCoverage=decoded_coverage,
+                  playbackTimeline=timeline,
+                  decodedFramesVerified=True, exportedFrames=len(output_decoded),
+                  measuredVideoDuration=measured_duration,
+                  sourceDecodedFrameOffset=decoded_offset,
+                  outputVideoStart=video_start,
+                  originalMetadata=cache['metadata'],
+                  auxiliaryTracks='Only primary video and audio included in playback file; original stream metadata preserved in this report.',
+                  exportedVideoPackets=len(clipped), method='Stream copy; original encoded video packets preserved. Container timestamps rebased for playback.')
+    (job['folder']/'edit-report.json').write_text(json.dumps(report,indent=2))
+    exported = dict(url='/download/'+ident+'/'+output.name,
+                             report='/download/'+ident+'/edit-report.json',
+                             start=coverage[0], end=actual_end, packets=len(clipped),
+                             duration=measured_duration, sourceDuration=data['duration'],
+                             frames=len(output_decoded),
+                             warning=('Over 3.5 seconds: APOPT may reduce its analysis frame rate. A tighter cut needs manual review or different source keyframes.'
+                                      if float(output_info['format']['duration']) > 3.5 else None))
+    job['export'] = exported
+    return exported
+
+
+def passthrough_original(job, ident):
+    data = job['result']
+    info = probe(job['source'], ['-show_streams','-show_format'])
+    video = next(s for s in info['streams'] if s['codec_type']=='video')
+    duration = max(float(video.get('duration') or 0),float(info['format']['duration']))
+    if duration > MAX_PLAYBACK_SECONDS or abs(float(video.get('start_time',0))) > .05:
+        return None
+    ext = job['source'].suffix.lower()
+    output = job['folder']/('clip'+ext)
+    shutil.copyfile(job['source'],output)
+    def checksum(path):
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream,'sha256').hexdigest()
+    source_hash, copied_hash = checksum(job['source']), checksum(output)
+    if source_hash != copied_hash:
+        output.unlink(missing_ok=True)
+        raise ValueError('Original-file copy verification failed.')
+    report = dict(original=data, originalMetadata=info, exportStart=0, exportEnd=data['duration'],
+                  requestedStart=data['inTime'], requestedEnd=data['outTime'],
+                  measuredVideoDuration=duration, exportedFrames=data['frames'],
+                  sourcePresentationCoverage=[0,data['duration']], decodedSourceCoverage=[0,data['duration']],
+                  videoPacketsVerified=True, decodedFramesVerified=True, relativePresentationTimingVerified=True,
+                  originalFileSHA256=source_hash, outputFileSHA256=copied_hash, originalFileUnchanged=True,
+                  method='Byte-identical original file; existing playback edits and all tracks preserved',
+                  verificationMode='Whole-file SHA256 equality; source frame count from analysis',
+                  boundaryRecovery=dict(retried=False,attempts=[]))
+    (job['folder']/'edit-report.json').write_text(json.dumps(report,indent=2))
+    result = dict(url='/download/'+ident+'/'+output.name,report='/download/'+ident+'/edit-report.json',
+                  start=0,end=data['duration'],duration=duration,sourceDuration=data['duration'],frames=data['frames'],
+                  packets=len(probe(output,['-select_streams','v:0','-show_packets','-show_entries','packet=pts_time'])['packets']),
+                  originalFileUnchanged=True,boundaryAdjusted=False,verificationAttempts=1,warning=None,
+                  boundaryNote='Original already fits 3.5 seconds; downloaded file is byte-identical.')
+    job['export'] = result
+    return result
+
+
+def export_verified(job, start, end, ident, allow_original=True):
+    """Bounded copy-only recovery with a fixed visible playback interval."""
+    data = job['result']
+    # Manual boundary changes always request a trim, even for a short source.
+    automatic = abs(start-data['inTime'])<.000002 and abs(end-data['outTime'])<.000002
+    if allow_original and automatic and job['source'].suffix.lower() in ('.mp4','.mov'):
+        result = passthrough_original(job,ident)
+        if result:
+            return result
+    keys, times = data['keys'], data['times']
+    head = max((t for t in keys if t <= start+1e-6), default=0)
+    index = bisect.bisect_left(times,end-1e-6)
+    tail = times[index] if index < len(times) else data['duration']
+    limit = data.get('durationLimit',MAX_PLAYBACK_SECONDS)
+    if limit is not None and tail-head > limit+.000001:
+        raise ValueError('Review required: a copy-only cut cannot fit 3.5 seconds at these boundaries. Adjust the interval or explicitly disable the duration limit.')
+    ends = [tail]+[times[index+step] for step in (1,2,4,8,16,32) if index+step < len(times)]
+    last_context = bisect.bisect_right(times,tail+MAX_EXTRA_CONTEXT_SECONDS)-1
+    if last_context >= index:
+        ends.append(times[last_context])
+    ends += [t for t in keys if tail < t <= tail+MAX_EXTRA_CONTEXT_SECONDS]
+    if data['duration'] <= tail+MAX_EXTRA_CONTEXT_SECONDS:
+        ends.append(data['duration'])
+    ends = sorted({t for t in ends if tail <= t <= tail+MAX_EXTRA_CONTEXT_SECONDS+.000001})
+    heads = [head]+sorted((t for t in keys if head-MAX_EXTRA_CONTEXT_SECONDS <= t < head-.000001),reverse=True)
+    if head <= MAX_EXTRA_CONTEXT_SECONDS and 0 not in heads:
+        heads.append(0)
+    attempts,cache = [],{}
+    best = None
+    best_output = job['folder']/'verified-best.tmp'
+    best_report = None
+    for candidate_head in heads:
+        if limit is not None and tail-candidate_head > limit+.000001:
+            continue
+        # An earlier head can never be shorter than the already verified result.
+        if best is not None and tail-candidate_head >= best['duration']-.001:
+            continue
+        for candidate_tail in ends:
+            try:
+                result = _export_attempt(job,start,end,candidate_head,candidate_tail,ident,cache,playback_end=tail)
+            except UnsafeCutError as error:
+                attempts.append(dict(start=candidate_head,end=candidate_tail,error=str(error)))
+                if error.boundary == 'head':
+                    break
+                continue
+            if limit is not None and result['duration'] > limit+.000001:
+                attempts.append(dict(start=candidate_head,end=candidate_tail,error='Measured duration exceeds the enabled limit.'))
+                continue
+            if best is None or result['duration'] < best['duration']-.000001:
+                best = result
+                best_report = json.loads((job['folder']/'edit-report.json').read_text())
+                best_report['boundaryRecovery'] = dict(retried=bool(attempts),attempts=list(attempts),
+                    requestedStart=start,requestedEnd=end,chosenSeekStart=candidate_head,chosenCutEnd=candidate_tail,
+                    addedCutTailSeconds=candidate_tail-tail,extraHeadSeconds=head-candidate_head,
+                    maximumContextSeconds=MAX_EXTRA_CONTEXT_SECONDS,playbackEnd=tail)
+                shutil.copyfile(job['folder']/result['url'].split('/')[-1],best_output)
+            # Longer coded tails have the same fixed visible interval, so cannot
+            # improve duration after this head has produced a verified candidate.
+            break
+    if best is None:
+        job.pop('export',None)
+        for ext in ('.mov','.mp4','.mkv'):
+            (job['folder']/('clip'+ext)).unlink(missing_ok=True)
+        message = attempts[-1]['error'] if attempts else 'No bounded copy-only cut fits.'
+        raise ValueError('Review required: '+message+' Recovery was limited to 0.25 seconds of source context; no re-encoding or long fallback was used.')
+    shutil.copyfile(best_output,job['folder']/best['url'].split('/')[-1])
+    best_output.unlink()
+    (job['folder']/'edit-report.json').write_text(json.dumps(best_report,indent=2))
+    best['boundaryAdjusted'] = bool(best_report['boundaryRecovery']['retried'])
+    best['boundaryNote'] = 'Original playback interval preserved; extra coded context is hidden by playback edits.'
+    best['verificationAttempts'] = len(attempts)+1
+    job['export'] = best
+    return best
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -377,90 +640,15 @@ class Handler(BaseHTTPRequestHandler):
                     request = json.loads(self.rfile.read(length))
                     job = JOBS[request['id']]
                     job.pop('export', None)
+                    if 'limitDuration' in request:
+                        if not isinstance(request['limitDuration'], bool):
+                            raise ValueError('Invalid duration-limit setting.')
+                        job['result']['durationLimit'] = MAX_PLAYBACK_SECONDS if request['limitDuration'] else None
                     data = job['result']
                     start, end = float(request['start']), float(request['end'])
                     if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= data['duration']+.001):
                         raise ValueError('Choose a valid in/out interval.')
-                    keys = data['keys']
-                    actual_start = max((t for t in keys if t <= start+1e-6), default=0)
-                    actual_end = next((t for t in data['times'] if t >= end-1e-6), data['duration'])
-                    ext = job['source'].suffix
-                    ext = ext if ext in ('.mp4','.mov') else '.mkv'
-                    output = job['folder']/('clip'+ext)
-                    # Only the head requires a keyframe. Packet decode order retains references
-                    # required by the tail; decoded-frame checks below validate the result.
-                    args = ['-y', '-ss', str(actual_start), '-i', str(job['source']), '-t',
-                            str(actual_end-actual_start), '-map', '0:v:0', '-map', '0:a?', '-map_metadata', '0',
-                            '-map_chapters', '-1', '-c', 'copy', '-avoid_negative_ts', 'disabled']
-                    if ext in ('.mp4', '.mov'):
-                        args += ['-movflags', '+faststart']
-                    args += [str(output)]
-                    run('ffmpeg', args)
-                    # Verify preservation of encoded video packets against source packet sequence.
-                    def packets(path):
-                        return probe(path, ['-select_streams','v:0','-show_packets','-show_data_hash','sha256',
-                                            '-show_entries','packet=data_hash,pts_time,duration_time'])['packets']
-                    original_packets, clipped_packets = packets(job['source']), packets(output)
-                    original = [p['data_hash'] for p in original_packets]
-                    clipped = [p['data_hash'] for p in clipped_packets]
-                    offset = next((i for i in range(len(original)-len(clipped)+1)
-                                   if original[i:i+len(clipped)] == clipped), None) if clipped else None
-                    matching = offset is not None
-                    timing_verified = False
-                    coverage = None
-                    if matching:
-                        corresponding = original_packets[offset:offset+len(clipped)]
-                        source_pts = [float(p['pts_time']) for p in corresponding]
-                        output_pts = [float(p['pts_time']) for p in clipped_packets]
-                        timing_verified = all(abs((a-source_pts[0])-(b-output_pts[0])) < .0001
-                                              for a,b in zip(source_pts,output_pts))
-                        source_origin = float(original_packets[0]['pts_time'])
-                        coverage = [min(source_pts)-source_origin,
-                                    max(float(p['pts_time'])+float(p.get('duration_time',0))
-                                        for p in corresponding)-source_origin]
-                        matching = coverage[0] <= start+.001 and coverage[1] >= end-.001
-                    if not matching or not timing_verified:
-                        output.unlink(missing_ok=True)
-                        raise ValueError('Export verification failed: content, timing, or requested coverage differs from the source. No download created.')
-                    def decoded_hashes(path):
-                        raw = run('ffmpeg', ['-err_detect', 'explode', '-i', str(path), '-map', '0:v:0',
-                                             '-an', '-fps_mode', 'passthrough', '-f', 'framemd5', '-'])
-                        return [line.split(',')[-1].strip() for line in raw.decode().splitlines()
-                                if line and not line.startswith('#')]
-                    source_decoded, output_decoded = decoded_hashes(job['source']), decoded_hashes(output)
-                    decoded_offset = next((i for i in range(len(source_decoded)-len(output_decoded)+1)
-                                           if source_decoded[i:i+len(output_decoded)] == output_decoded), None) if output_decoded else None
-                    output_info = probe(output, ['-show_streams', '-show_format'])
-                    output_video = next(s for s in output_info['streams'] if s['codec_type'] == 'video')
-                    measured_duration = float(output_video.get('duration') or output_info['format']['duration'])
-                    video_start = float(output_video.get('start_time', 0))
-                    if abs(video_start) > .05 or float(output_info['format']['duration']) > measured_duration+.1:
-                        output.unlink(missing_ok=True)
-                        raise ValueError('Export has an inconsistent playback timeline. No download created.')
-                    if decoded_offset is None or len(output_decoded) < 2:
-                        output.unlink(missing_ok=True)
-                        raise ValueError('Export did not decode to a continuous sequence of original frames. No download created.')
-                    actual_end = coverage[1]
-                    report = dict(requestedStart=start, requestedEnd=end, exportStart=actual_start,
-                                  exportEnd=actual_end, original=data, videoPacketsVerified=True,
-                                  relativePresentationTimingVerified=timing_verified,
-                                  sourcePresentationCoverage=coverage,
-                                  decodedFramesVerified=True, exportedFrames=len(output_decoded),
-                                  measuredVideoDuration=measured_duration,
-                                  sourceDecodedFrameOffset=decoded_offset,
-                                  outputVideoStart=video_start,
-                                  originalMetadata=probe(job['source'], ['-show_streams', '-show_format']),
-                                  auxiliaryTracks='Only primary video and audio included in playback file; original stream metadata preserved in this report.',
-                                  exportedVideoPackets=len(clipped), method='Stream copy; original encoded video packets preserved. Container timestamps rebased for playback.')
-                    (job['folder']/'edit-report.json').write_text(json.dumps(report,indent=2))
-                    exported = dict(url='/download/'+request['id']+'/'+output.name,
-                                             report='/download/'+request['id']+'/edit-report.json',
-                                             start=coverage[0], end=actual_end, packets=len(clipped),
-                                             duration=measured_duration, sourceDuration=data['duration'],
-                                             frames=len(output_decoded),
-                                             warning=('Over 3.5 seconds: APOPT may reduce its analysis frame rate. A tighter cut needs manual review or different source keyframes.'
-                                                      if float(output_info['format']['duration']) > 3.5 else None))
-                    job['export'] = exported
+                    exported = export_verified(job,start,end,request['id'],allow_original=request.get('keepOriginal',True) is True)
                     return self.respond(exported)
                 self.respond({'error':'Not found'},404)
             finally:

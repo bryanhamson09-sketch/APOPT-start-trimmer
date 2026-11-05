@@ -16,7 +16,7 @@ function renderQueue(){
     cell(item.exported?time(item.exported.duration):(item.result?`Onset ${time(item.result.start)}`:'—'));
     const actions=cell('');
     const open=document.createElement('button');open.textContent=item.result?'Review':'Open';open.disabled=busy||queue.running;open.onclick=()=>openItem(item);actions.append(open);
-    if(item.exported){const link=document.createElement('a');link.href=item.exported.url;link.textContent='Download';link.className='link';link.style.marginLeft='6px';link.download=item.file.name.replace(/\.[^.]+$/,'')+'-trimmed'+item.exported.url.match(/\.[^.]+$/)[0];actions.append(link);if(item.exported.warning){const note=document.createElement('div');note.className='note';note.textContent=item.exported.warning;actions.append(note)}}
+    if(item.exported){const link=document.createElement('a');link.href=item.exported.url;link.textContent='Download';link.className='link';link.style.marginLeft='6px';link.download=item.file.name.replace(/\.[^.]+$/,'')+'-trimmed'+item.exported.url.match(/\.[^.]+$/)[0];actions.append(link);if(item.exported.warning||item.exported.boundaryNote){const note=document.createElement('div');note.className='note';note.textContent=[item.exported.boundaryNote,item.exported.warning].filter(Boolean).join(' ');actions.append(note)}}
     if(!previous)rows.append(row);rowCache.set(item.key,{row,signature});
   }
   const blocked=busy||queue.running||!token;
@@ -38,7 +38,7 @@ $('folder').onchange=e=>{addToQueue(e.target.files);e.target.value=''};
 $('runBatch').onclick=async()=>{
   if(busy||queue.running||!token)return;
   $('bundleLink').hidden=true;v.pause();lock(true);
-  try{await queue.run(settings(),{analyze:analyzeFile,export:(id,bounds)=>post('/api/export',JSON.stringify({id,...bounds}),{'Content-Type':'application/json'})});}
+  try{await queue.run(settings(),{analyze:analyzeFile,export:(id,bounds,saved)=>post('/api/export',JSON.stringify({id,...bounds,keepOriginal:saved.keepOriginal,limitDuration:saved.tight}),{'Content-Type':'application/json'})});}
   finally{lock(false);renderQueue();message('Batch paused or finished. Review flagged videos, or download completed clips together.');}
 };
 $('stopBatch').onclick=()=>queue.stop();$('retryBatch').onclick=()=>queue.retry();

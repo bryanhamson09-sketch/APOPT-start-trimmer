@@ -32,9 +32,9 @@ class VideoQueue {
             item.status='Review';item.error=item.result.reason||'Confirm onset before export.';continue;
           }
           item.status='Exporting';this.update();
-          item.exported=await ops.export(item.result.id,item.bounds);
+          item.exported=await ops.export(item.result.id,item.bounds,saved);
           item.status='Done';item.error='';
-        }catch(error){item.status='Failed';item.error=error.message||String(error);}
+        }catch(error){item.error=error.message||String(error);item.status=item.error.startsWith('Review required:')?'Review':'Failed';}
         finally{this.update();}
       }
     }finally{this.running=false;this.update();}

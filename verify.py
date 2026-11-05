@@ -82,7 +82,7 @@ def main():
         subprocess.run([server.binary('ffmpeg'),'-v','error','-y','-i',str(source),
                         '-c:v','libx264','-g','720','-keyint_min','720','-sc_threshold','0',
                         str(long_gop)],check=True)
-        long_data = post('/api/analyze',long_gop.read_bytes(), **{'X-Extension':'.mp4','X-Lead':'.75'})
+        long_data = post('/api/analyze',long_gop.read_bytes(), **{'X-Extension':'.mp4','X-Lead':'.75','X-Tight':'0'})
         assert len(long_data['keys']) == 1
         long_export = post('/api/export',json.dumps(dict(id=long_data['id'],start=1.71,end=4.61)).encode())
         assert 4.61 <= long_export['duration'] < 4.75, long_export

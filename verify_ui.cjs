@@ -11,12 +11,12 @@ class Element{
 }
 const elements=Object.fromEntries([...ids].map(id=>[id,new Element(id)]));
 elements.lead.value='.75';elements.signal.value='motion';
-let count=0,requests=[];
+let count=0,requests=[],exportPayloads=[];
 const sandbox={console,document:{getElementById:id=>{assert.ok(ids.has(id),'Missing HTML control '+id);return elements[id]},createElement:()=>new Element()},URL:{createObjectURL:()=> 'blob:fixture',revokeObjectURL(){}},fetch:async(url,options={})=>{
   requests.push(url);let data;
   if(url==='/api/status')data={ready:true,token:'local-fixture'};
   else if(url==='/api/analyze'){const quiet=options.body.name==='quiet.mov';data={id:'job'+(++count),inTime:3.25,outTime:5.2,start:4,set:2,exit:5.2,duration:6,width:320,height:180,frames:720,fps:'120/1',times:[0,1,2,3,4,5,6],scores:[0,0,0,0,1,0,0],keys:[0,1,2,3,4,5],confidence:quiet?'Review required':'Candidate found',onsetDetection:quiet?null:{},reason:'Fixture'};}
-  else if(url==='/api/export')data={url:'/download/test/clip.mov',report:'/download/test/edit-report.json',duration:2.2,sourceDuration:6,frames:264};
+  else if(url==='/api/export'){exportPayloads.push(JSON.parse(options.body));data={url:'/download/test/clip.mov',report:'/download/test/edit-report.json',duration:2.2,sourceDuration:6,frames:264};}
   else if(url==='/api/bundle')data={url:'/bundle/test',count:1};
   else data={ok:true};
   return {ok:true,json:async()=>data,blob:async()=>({})};
@@ -35,7 +35,7 @@ async function main(){
   vm.runInContext('openItem(queue.items[0])',sandbox);
   assert.equal(elements.in.value,'3.250000');assert.equal(elements.out.value,'5.200000');
   elements.video.onloadedmetadata();assert.equal(elements.out.value,'5.200000');
-  elements.signal.value='curvature';elements.signal.onchange();
+  elements.signal.value='curvature';elements.signal.onchange();vm.runInContext('result.motionFit={changePointFit:{times:[3,4,5],values:[0,1,2],baseline:[0,0,0]}}',sandbox);elements.signal.value='model';elements.signal.onchange();assert.equal(exportPayloads[0].keepOriginal,true);assert.equal(exportPayloads[0].limitDuration,true);elements.tight.checked=false;elements.keepOriginal.checked=false;await elements.export.onclick();assert.equal(exportPayloads.at(-1).keepOriginal,false);assert.equal(exportPayloads.at(-1).limitDuration,false);
   await elements.bundle.onclick();assert.equal(elements.bundleLink.hidden,false);
   await elements.clearBatch.onclick();assert.equal(vm.runInContext('queue.items.length',sandbox),0);
   assert.equal(elements.runBatch.disabled,true);
