@@ -51,13 +51,13 @@ The queue is not persisted across a page refresh. Temporary originals, dummy cop
 
 The server binds only to 127.0.0.1, checks hosts and requires a per-session token for processing. No remote video uploads, third-party scripts/fonts, analytics or accounts are used. No processing history is persisted. Installing FFmpeg requires a one-time download; all subsequent processing works offline. Intended for one trusted local user; each FFmpeg operation has a three-minute timeout.
 
-Checks:
+Checks/Debugging:
 
-- `python verify_onset.py`: noisy step, quadratic, linear, oscillating and multi-lobe rises; isolated spikes, quiet signals and irregular timestamps. Known fixtures do not establish physical onset accuracy on all athlete footage.
-- `python verify_timeline.py`: version 0/1 metadata fields, empty edits, unchanged media/file offsets, idempotence and rejection before metadata writes.
-- `python verify_policy.py`: Ashley Start7 original-file SHA256 equality, forced-remux hidden-frame handling, Ashley samples and enforced duration limit.
-- `python verify_boundary.py`: seven Bryan 30/120 fps sources, the former tail-gap case, strict decoded coverage and fixed visible playback durations.
-- `python verify.py`: synthetic 120 fps exports, explicit long-export opt-out, batch ZIP contents, duplicate names and cleanup through an isolated local HTTP server.
-- `node verify_queue.cjs` and `node verify_ui.cjs`: queue behavior and actual page scripts with DOM/API fixtures, including review routing and export settings. Fixture tests do not replace visual browser QA.
+- noisy step, quadratic, linear, oscillating and multi-lobe rises; isolated spikes, quiet signals and irregular timestamps. Known fixtures do not establish physical onset accuracy on all athlete footage.
+- version 0/1 metadata fields, empty edits, unchanged media/file offsets, idempotence and rejection before metadata writes.
+-  forced-remux hidden-frame handling, video samples and enforced duration limit.
+- seven video 30/120 fps sources, the former tail-gap case, strict decoded coverage and fixed visible playback durations.
+- synthetic 120 fps exports, explicit long-export opt-out, batch ZIP contents, duplicate names and cleanup through an isolated local HTTP server.
+- queue behavior and actual page scripts with DOM/API fixtures, including review routing and export settings. Fixture tests do not replace visual browser QA.
 
 Real-video regression artifacts are saved under `outputs/start-video-editor/` when the relevant script specifies it; intermediates remain in ignored `test-output/`.
